@@ -65,6 +65,50 @@ callsRouter.post("/initiate", async (req: Request, res: Response) => {
   }
 });
 
+callsRouter.post("/test-session", async (req, res) => {
+  const { phone, name } = req.body;
+
+  if (!phone) {
+    return res.status(400).json({
+      success: false,
+      error: "phone is required",
+    });
+  }
+
+  const normalizedPhone = normalizePhone(phone);
+
+  let lastCall = null;
+
+  // Optional memory lookup
+  try {
+    lastCall = await prisma.call.findFirst({
+      where: { phone: normalizedPhone },
+      orderBy: { createdAt: "desc" },
+    });
+  } catch (err) {
+    console.error("[test-session] Failed to load previous call:", err);
+  }
+
+  const systemPrompt = buildSystemPrompt({
+    phone: normalizedPhone,
+    name: name ?? lastCall?.name ?? undefined,
+    lastSummary: lastCall?.summary ?? null,
+  });
+
+  setPendingCall(normalizedPhone, {
+    systemPrompt,
+    name: name ?? lastCall?.name ?? undefined,
+  });
+
+  return res.json({
+    success: true,
+    data: {
+      phone: normalizedPhone,
+      usedPreviousSummary: !!lastCall?.summary,
+    },
+  });
+});
+
 // =========================================================
 // POST /api/calls/webhook/voice?phone=...
 // Twilio hits this once the call is answered -> returns TwiML

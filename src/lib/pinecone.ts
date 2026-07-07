@@ -43,7 +43,7 @@ export async function upsertCallSummary({ callId, phone, name, summary }: Upsert
     const isNotFound = err?.name === "PineconeNotFoundError" || err?.message?.includes("404");
     if (!isNotFound) throw err;
 
-    const dimension = 1024;
+    const dimension = 3072;
     const cloud = (process.env.PINECONE_CLOUD || "aws") as any;
     const region = (process.env.PINECONE_REGION || "us-east-1") as string;
 
