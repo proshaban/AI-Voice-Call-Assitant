@@ -1,0 +1,21 @@
+generator client {
+  provider = "prisma-client-js"
+  engineType = "client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Call {
+  id        String   @id @default(uuid())
+  name      String?
+  phone     String
+  summary   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Speeds up "fetch last call summary for this phone" lookups
+  @@index([phone, createdAt])
+  @@map("calls")
+}
