@@ -1,8 +1,5 @@
 # Voice Call Backend (Express)
-
-Same functionality as the Next.js version, ported to a plain Express app —
-no framework workarounds needed since Express + `ws` handles the persistent
-WebSocket connection natively.
+I made this app for managing appointments for local business or organisations.
 
 ## What it does
 
