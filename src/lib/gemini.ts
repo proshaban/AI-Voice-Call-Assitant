@@ -24,27 +24,48 @@ type LiveSessionCallbacks = {
 };
 
 /**
- * Opens a Gemini Live session for one phone call.
+ * A single Gemini Live function-calling tool: the declaration is what the
+ * model sees (name/description/params), the handler is what actually runs
+ * locally when the model decides to call it.
+ */
+export type LiveTool = {
+  declaration: Record<string, unknown>;
+  handler: (args: Record<string, any>) => Promise<Record<string, unknown>>;
+};
+
+/**
+ * Opens a Gemini Live session for one phone call, optionally wired up with
+ * function-calling tools (e.g. appointment booking).
  *
- * NOTE: The exact shape of `ai.live.connect` (event names, config keys)
- * has shifted across @google/genai versions — check the installed
- * version's docs and adjust field names below if the SDK has moved on.
+ * NOTE: The exact shape of `ai.live.connect` (event names, config keys,
+ * tool-call/tool-response field names) has shifted across @google/genai
+ * versions — check the installed version's docs and adjust below if the
+ * SDK has moved on.
  */
 export async function startLiveSession(
   systemPrompt: string,
   callbacks: LiveSessionCallbacks,
+  tools: LiveTool[] = [],
 ): Promise<LiveSessionHandle> {
-  const session = await ai.live.connect({
+  const toolHandlers = new Map(tools.map((t) => [t.declaration.name as string, t.handler]));
+
+  let session: any;
+
+  session = await ai.live.connect({
     model: LIVE_MODEL,
     config: {
       responseModalities: [Modality.AUDIO],
       systemInstruction: systemPrompt,
       inputAudioTranscription: {},
       outputAudioTranscription: {},
+      ...(tools.length
+        ? { tools: [{ functionDeclarations: tools.map((t) => t.declaration) }] }
+        : {}),
     },
     callbacks: {
-      onmessage: (message: any) => {
+      onmessage: async (message: any) => {
         try {
+          // Audio output from the model
           const audioPart = message?.serverContent?.modelTurn?.parts?.find(
             (p: any) => p.inlineData?.mimeType?.startsWith("audio/"),
           );
@@ -52,6 +73,7 @@ export async function startLiveSession(
             callbacks.onAudio(audioPart.inlineData.data);
           }
 
+          // Transcripts (used later to build the post-call summary)
           const inputTranscript = message?.serverContent?.inputTranscription?.text;
           if (inputTranscript) {
             callbacks.onTranscriptTurn({ role: "user", text: inputTranscript });
@@ -59,6 +81,28 @@ export async function startLiveSession(
           const outputTranscript = message?.serverContent?.outputTranscription?.text;
           if (outputTranscript) {
             callbacks.onTranscriptTurn({ role: "model", text: outputTranscript });
+          }
+
+          // Tool calls — the model wants to run one of our functions
+          const functionCalls = message?.toolCall?.functionCalls;
+          if (functionCalls?.length) {
+            const functionResponses = await Promise.all(
+              functionCalls.map(async (fc: any) => {
+                const handler = toolHandlers.get(fc.name);
+                let response: Record<string, unknown>;
+                if (!handler) {
+                  response = { error: `Unknown tool: ${fc.name}` };
+                } else {
+                  try {
+                    response = await handler(fc.args ?? {});
+                  } catch (err) {
+                    response = { error: (err as Error).message };
+                  }
+                }
+                return { id: fc.id, name: fc.name, response };
+              }),
+            );
+            session.sendToolResponse({ functionResponses });
           }
         } catch (err) {
           callbacks.onError(err);
@@ -102,7 +146,7 @@ export async function generateCallSummary(turns: LiveTurn[]): Promise<string> {
         role: "user",
         parts: [
           {
-            text: `Summarize the following phone call transcript in 100-200 words. Write in plain prose (no bullet points), covering: what was discussed, the caller's key responses/intent, and any next steps or outcome. Be factual and concise.\n\nTRANSCRIPT:\n${transcript}`,
+            text: `Summarize the following phone call transcript in 100-200 words. Write in plain prose (no bullet points), covering: what was discussed, the caller's key responses/intent (e.g. what appointment was booked, with which specialist, at what time — or why no booking was made), and any next steps or outcome. Be factual and concise.\n\nTRANSCRIPT:\n${transcript}`,
           },
         ],
       },

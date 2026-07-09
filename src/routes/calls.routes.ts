@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { normalizePhone } from "../lib/phone.js";
-import { buildSystemPrompt } from "../lib/prompt.js";
+import { buildAppointmentSystemPrompt } from "../lib/prompt.js";
 import { setPendingCall } from "../lib/pendingCalls.js";
 import { initiateOutboundCall, buildVoiceTwiml } from "../lib/twilio.js";
 
@@ -10,6 +10,11 @@ export const callsRouter = Router();
 // =========================================================
 // POST /api/calls/initiate
 // Body: { phone: string, name?: string }
+//
+// Before dialing: checks Postgres for (a) an existing upcoming
+// appointment and (b) the last call summary for this phone number,
+// and folds whatever it finds into the system prompt so the agent
+// has full context the moment the call connects.
 // =========================================================
 callsRouter.post("/initiate", async (req: Request, res: Response) => {
   try {
@@ -21,32 +26,40 @@ callsRouter.post("/initiate", async (req: Request, res: Response) => {
 
     const normalizedPhone = normalizePhone(phone);
 
-    // Default values
-    let lastCall: {
-      name: string | null;
-      summary: string | null;
-    } | null = null;
-
-    // Memory lookup should NEVER stop the call
-    try {
-      lastCall = await prisma.call.findFirst({
+    const [existingAppointment, lastCall] = await Promise.all([
+      prisma.appointment.findFirst({
+        where: {
+          phone: normalizedPhone,
+          status: { in: ["active", "pending", "ongoing"] },
+          dateTime: { gte: new Date() },
+        },
+        orderBy: { dateTime: "asc" },
+      }),
+      prisma.call.findFirst({
         where: { phone: normalizedPhone },
         orderBy: { createdAt: "desc" },
-      });
-    } catch (err) {
-      console.error(
-        "[POST /api/calls/initiate] Failed to fetch previous call history:",
-        err
-      );
-    }
+      }),
+    ]);
 
-    const systemPrompt = buildSystemPrompt({
-      name: name ?? lastCall?.name ?? undefined,
+    const systemPrompt = buildAppointmentSystemPrompt({
       phone: normalizedPhone,
-      lastSummary: lastCall?.summary ?? null,
+      lastCallSummary: lastCall?.summary ?? null,
+      existingAppointment: existingAppointment
+        ? {
+            name: existingAppointment.name,
+            specialist: existingAppointment.specialist,
+            localTime: new Intl.DateTimeFormat("en-GB", {
+              hour: "2-digit",
+              minute: "2-digit",
+              hour12: false,
+              timeZone: process.env.CLINIC_TIMEZONE || "Asia/Kolkata",
+            }).format(existingAppointment.dateTime),
+            dateTime: existingAppointment.dateTime.toISOString(),
+          }
+        : null,
     });
 
-    setPendingCall(normalizedPhone, { systemPrompt, name });
+    setPendingCall(normalizedPhone, { systemPrompt, name: name ?? existingAppointment?.name });
 
     const call = await initiateOutboundCall(normalizedPhone);
 
@@ -55,6 +68,7 @@ callsRouter.post("/initiate", async (req: Request, res: Response) => {
       data: {
         callSid: call.sid,
         phone: normalizedPhone,
+        hasExistingAppointment: Boolean(existingAppointment),
         usedPreviousSummary: Boolean(lastCall?.summary),
       },
     });
@@ -63,50 +77,6 @@ callsRouter.post("/initiate", async (req: Request, res: Response) => {
     console.error("[POST /api/calls/initiate]", message);
     return res.status(500).json({ success: false, error: message });
   }
-});
-
-callsRouter.post("/test-session", async (req, res) => {
-  const { phone, name } = req.body;
-
-  if (!phone) {
-    return res.status(400).json({
-      success: false,
-      error: "phone is required",
-    });
-  }
-
-  const normalizedPhone = normalizePhone(phone);
-
-  let lastCall = null;
-
-  // Optional memory lookup
-  try {
-    lastCall = await prisma.call.findFirst({
-      where: { phone: normalizedPhone },
-      orderBy: { createdAt: "desc" },
-    });
-  } catch (err) {
-    console.error("[test-session] Failed to load previous call:", err);
-  }
-
-  const systemPrompt = buildSystemPrompt({
-    phone: normalizedPhone,
-    name: name ?? lastCall?.name ?? undefined,
-    lastSummary: lastCall?.summary ?? null,
-  });
-
-  setPendingCall(normalizedPhone, {
-    systemPrompt,
-    name: name ?? lastCall?.name ?? undefined,
-  });
-
-  return res.json({
-    success: true,
-    data: {
-      phone: normalizedPhone,
-      usedPreviousSummary: !!lastCall?.summary,
-    },
-  });
 });
 
 // =========================================================
@@ -159,4 +129,20 @@ callsRouter.get("/:id", async (req: Request, res: Response) => {
   }
 
   res.status(200).json({ success: true, data: call });
+});
+
+// =========================================================
+// GET /api/calls/appointments?phone=...
+// List saved appointments, soonest first (optional ?phone= filter)
+// =========================================================
+callsRouter.get("/appointments/list", async (req: Request, res: Response) => {
+  const phone = (req.query.phone as string) || undefined;
+
+  const appointments = await prisma.appointment.findMany({
+    where: phone ? { phone } : undefined,
+    orderBy: { dateTime: "asc" },
+    take: 100,
+  });
+
+  res.status(200).json({ success: true, data: appointments });
 });

@@ -1,14 +1,16 @@
 import type WebSocket from "ws";
-import { prisma } from "./prisma.js";
-import { getPendingCall, deletePendingCall } from "./pendingCalls.js";
-import { startLiveSession, generateCallSummary, LiveTurn, LiveSessionHandle } from "./gemini.js";
-import { upsertCallSummary } from "./pinecone.js";
-import { geminiAudioToTwilio, twilioAudioToGemini } from "./audio.js";
-import { buildSystemPrompt } from "./prompt.js";
+import { prisma } from "./prisma";
+import { getPendingCall, deletePendingCall } from "./pendingCalls";
+import { startLiveSession, generateCallSummary, LiveTurn, LiveSessionHandle } from "./gemini";
+import { upsertCallSummary } from "./pinecone";
+import { geminiAudioToTwilio, twilioAudioToGemini } from "./audio";
+import { buildAppointmentSystemPrompt } from "./prompt";
+import { appointmentTools } from "./appointment-tools";
 
 /**
  * Handles ONE Twilio Media Stream WebSocket connection end-to-end:
  *   Twilio "start"  -> read phone from customParameters, open Gemini Live session
+ *                       (with appointment-booking tools attached)
  *   Twilio "media"  -> forward caller audio to Gemini
  *   Gemini audio    -> forward back to Twilio
  *   Twilio "stop"   -> close Gemini session, summarize transcript, persist result
@@ -48,35 +50,35 @@ export function handleTwilioStream(ws: WebSocket) {
         }
 
         const pending = getPendingCall(phone);
-
+        name = pending?.name;
         const systemPrompt =
-          pending?.systemPrompt ??
-          buildSystemPrompt({
-            phone,
-            name: undefined,
-            lastSummary: null,
-          });
+          pending?.systemPrompt ?? buildAppointmentSystemPrompt({ phone });
+        deletePendingCall(phone);
 
         try {
-          liveSession = await startLiveSession(systemPrompt, {
-            onAudio: (pcm24kBase64) => {
-              if (ws.readyState !== ws.OPEN || !streamSid) return;
-              ws.send(
-                JSON.stringify({
-                  event: "media",
-                  streamSid,
-                  media: { payload: geminiAudioToTwilio(pcm24kBase64) },
-                }),
-              );
+          liveSession = await startLiveSession(
+            systemPrompt,
+            {
+              onAudio: (pcm24kBase64) => {
+                if (ws.readyState !== ws.OPEN || !streamSid) return;
+                ws.send(
+                  JSON.stringify({
+                    event: "media",
+                    streamSid,
+                    media: { payload: geminiAudioToTwilio(pcm24kBase64) },
+                  }),
+                );
+              },
+              onTranscriptTurn: (turn) => transcript.push(turn),
+              onClose: () => {
+                finalizeCall();
+              },
+              onError: (err) => {
+                console.error("[callSession] Gemini Live error:", err);
+              },
             },
-            onTranscriptTurn: (turn) => transcript.push(turn),
-            onClose: () => {
-              finalizeCall();
-            },
-            onError: (err) => {
-              console.error("[callSession] Gemini Live error:", err);
-            },
-          });
+            appointmentTools,
+          );
         } catch (err) {
           console.error("[callSession] Failed to start Gemini Live session:", err);
           ws.close();
