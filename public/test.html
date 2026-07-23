@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Lead Call Assistant — Local Test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; background: #0f1115; color: #e6e6e6; }
+  h1 { font-size: 1.2rem; }
+  fieldset { border: 1px solid #333; border-radius: 8px; margin-bottom: 16px; }
+  legend { padding: 0 6px; color: #9ad; }
+  label { display: inline-block; min-width: 90px; }
+  input, select { background: #1a1d23; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 6px 8px; margin: 3px 0; }
+  input { width: 240px; }
+  select { width: 420px; max-width: 100%; }
+  button { background: #2563eb; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px; margin: 4px 4px 4px 0; cursor: pointer; }
+  button:disabled { background: #444; cursor: not-allowed; }
+  button.stop { background: #dc2626; }
+  #status { margin: 8px 0; color: #9ad; min-height: 1.2em; }
+  #log { border: 1px solid #333; border-radius: 8px; padding: 10px; height: 340px; overflow-y: auto; font-size: 0.9rem; background: #12141a; }
+  .u { color: #7dd3fc; } .a { color: #a7f3d0; } .s { color: #999; font-style: italic; } .e { color: #f87171; }
+  .row { margin: 2px 0; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>🎙️ Lead Call Assistant — Local Test (browser mic ↔ Gemini)</h1>
+
+<fieldset>
+  <legend>1. Pick or create a lead</legend>
+  <div>
+    <label>Lead</label>
+    <select id="leadSelect"></select>
+    <button id="refreshLeads" type="button">↻</button>
+  </div>
+  <div style="margin-top:8px; border-top: 1px dashed #333; padding-top: 8px;">
+    <div><label>Name</label><input id="newName" placeholder="Test Client" /></div>
+    <div><label>Phone</label><input id="newPhone" placeholder="+919999999999" /></div>
+    <div><label>Job</label><input id="newJob" placeholder="E-commerce website" /></div>
+    <button id="createLead" type="button">Create test lead</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>2. Talk to the agent</legend>
+  <button id="startBtn" type="button">▶ Start test call</button>
+  <button id="stopBtn" type="button" class="stop" disabled>■ End call</button>
+  <div id="status">Idle.</div>
+</fieldset>
+
+<div id="log"></div>
+
+<script>
+const logEl = document.getElementById("log");
+const statusEl = document.getElementById("status");
+const leadSelect = document.getElementById("leadSelect");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+
+let ws = null;
+let micCtx = null, micStream = null, micNode = null;
+let playCtx = null, playTime = 0, activeSources = [];
+
+function log(cls, text) {
+  const div = document.createElement("div");
+  div.className = "row " + cls;
+  div.textContent = text;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(t) { statusEl.textContent = t; }
+
+// ── Leads ────────────────────────────────────────────────
+async function loadLeads() {
+  const res = await fetch("/api/leads");
+  const { data } = await res.json();
+  leadSelect.innerHTML = "";
+  for (const l of data) {
+    const opt = document.createElement("option");
+    opt.value = l.id;
+    const calls = Array.isArray(l.summary) ? l.summary.length : 0;
+    opt.textContent = `${l.name} — ${l.phone} (${l.status}/${l.stage}, ${calls} call${calls === 1 ? "" : "s"})`;
+    leadSelect.appendChild(opt);
+  }
+  if (!data.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "— no leads yet, create one below —";
+    leadSelect.appendChild(opt);
+  }
+}
+document.getElementById("refreshLeads").onclick = loadLeads;
+
+document.getElementById("createLead").onclick = async () => {
+  const name = document.getElementById("newName").value.trim() || "Test Client";
+  const phone = document.getElementById("newPhone").value.trim() || "+919999999999";
+  const jobDescription = document.getElementById("newJob").value.trim() || null;
+  const res = await fetch("/api/leads", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, phone, jobDescription }),
+  });
+  const body = await res.json();
+  if (!body.success) { log("e", "Create failed: " + body.error); return; }
+  log("s", `Lead created: ${body.data.id}`);
+  await loadLeads();
+  leadSelect.value = body.data.id;
+};
+
+// ── Audio playback (server sends PCM16 @ 24kHz binary) ───
+function playChunk(arrayBuffer) {
+  if (!playCtx) { playCtx = new AudioContext({ sampleRate: 24000 }); playTime = playCtx.currentTime; }
+  const int16 = new Int16Array(arrayBuffer);
+  const float32 = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+  const buf = playCtx.createBuffer(1, float32.length, 24000);
+  buf.getChannelData(0).set(float32);
+  const src = playCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playCtx.destination);
+  const startAt = Math.max(playTime, playCtx.currentTime + 0.05);
+  src.start(startAt);
+  playTime = startAt + buf.duration;
+  activeSources.push(src);
+  src.onended = () => { activeSources = activeSources.filter((s) => s !== src); };
+}
+function stopPlayback() {
+  for (const s of activeSources) { try { s.stop(); } catch {} }
+  activeSources = [];
+  if (playCtx) playTime = playCtx.currentTime;
+}
+
+// ── Mic capture (send PCM16 @ 16kHz binary) ──────────────
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  });
+  micCtx = new AudioContext({ sampleRate: 16000 });
+  const source = micCtx.createMediaStreamSource(micStream);
+  micNode = micCtx.createScriptProcessor(2048, 1, 1);
+  micNode.onaudioprocess = (e) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const f32 = e.inputBuffer.getChannelData(0);
+    const i16 = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      i16[i] = s < 0 ? s * 32768 : s * 32767;
+    }
+    ws.send(i16.buffer);
+  };
+  source.connect(micNode);
+  micNode.connect(micCtx.destination);
+}
+function stopMic() {
+  micNode?.disconnect(); micNode = null;
+  micStream?.getTracks().forEach((t) => t.stop()); micStream = null;
+  micCtx?.close(); micCtx = null;
+}
+
+// ── Session ──────────────────────────────────────────────
+startBtn.onclick = async () => {
+  const leadId = leadSelect.value;
+  if (!leadId) { log("e", "Pick or create a lead first."); return; }
+
+  startBtn.disabled = true;
+  setStatus("Connecting…");
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/api/calls/monitor?leadId=${encodeURIComponent(leadId)}`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onmessage = (ev) => {
+    if (ev.data instanceof ArrayBuffer) { playChunk(ev.data); return; }
+    let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "ready") {
+      setStatus(`Live — ${msg.lead.name} (${msg.followUp ? "follow-up" : "new"} call). Speak!`);
+      log("s", `Session ready (${msg.followUp ? "follow-up" : "new"} call prompt).`);
+      stopBtn.disabled = false;
+    } else if (msg.type === "transcript") {
+      log(msg.role === "user" ? "u" : "a", (msg.role === "user" ? "You: " : "Agent: ") + msg.text);
+    } else if (msg.type === "interrupted") {
+      stopPlayback();
+    } else if (msg.type === "closed") {
+      log("s", "Session closed by server.");
+      cleanup();
+    } else if (msg.type === "error") {
+      log("e", "Error: " + msg.message);
+    }
+  };
+
+  ws.onclose = () => cleanup();
+  ws.onerror = () => log("e", "WebSocket error.");
+
+  try {
+    await startMic();
+  } catch (err) {
+    log("e", "Mic access failed: " + err.message);
+    cleanup();
+  }
+};
+
+stopBtn.onclick = () => { ws?.close(); cleanup(); };
+
+function cleanup() {
+  stopMic();
+  stopPlayback();
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+  ws = null;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  setStatus("Idle.");
+  loadLeads(); // refresh summaries/status after the call
+}
+
+loadLeads();
+</script>
+</body>
+</html>

@@ -1,5 +1,5 @@
 {
-  "name": "voice-call-backend-express",
+  "name": "lead-call-assistant",
   "type": "module",
   "version": "1.0.0",
   "private": true,
@@ -12,8 +12,7 @@
     "prisma:migrate": "prisma migrate dev --name init"
   },
   "dependencies": {
-    "@google/genai": "^0.15.0",
-    "@pinecone-database/pinecone": "^3.0.0",
+    "@google/genai": "^2.13.0",
     "@prisma/adapter-pg": "^7.0.0",
     "@prisma/client": "^7.8.0",
     "cors": "^2.8.5",

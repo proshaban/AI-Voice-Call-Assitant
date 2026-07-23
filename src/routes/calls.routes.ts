@@ -1,76 +1,53 @@
 import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { normalizePhone } from "../lib/phone.js";
-import { buildAppointmentSystemPrompt } from "../lib/prompt.js";
-import { setPendingCall } from "../lib/pendingCalls.js";
-import { initiateOutboundCall, buildVoiceTwiml } from "../lib/twilio.js";
+import { setCallContext, linkCallId } from "../lib/callRegistry.js";
+import { buildNewCallPrompt, buildFollowUpPrompt, buildInboundPrompt } from "../lib/prompt.js";
+import { initiateOutboundCall } from "../lib/provider.js";
+import {
+  buildVobizAnswerXml,
+  buildVobizHangupXml,
+  handleVobizHangup,
+} from "../lib/vobiz.js";
+import { buildTwilioVoiceTwiml } from "../lib/twilio.js";
 
 export const callsRouter = Router();
 
 // =========================================================
 // POST /api/calls/initiate
-// Body: { phone: string, name?: string }
-//
-// Before dialing: checks Postgres for (a) an existing upcoming
-// appointment and (b) the last call summary for this phone number,
-// and folds whatever it finds into the system prompt so the agent
-// has full context the moment the call connects.
+// Body: { leadId } — manually trigger a call to an existing lead
+// (the dialer cron normally does this on its own)
 // =========================================================
 callsRouter.post("/initiate", async (req: Request, res: Response) => {
   try {
-    const { phone, name } = req.body as { phone?: string; name?: string };
-
-    if (!phone) {
-      return res.status(400).json({ success: false, error: "`phone` is required" });
+    const { leadId } = req.body as { leadId?: string };
+    if (!leadId) {
+      return res.status(400).json({ success: false, error: "`leadId` is required" });
     }
 
-    const normalizedPhone = normalizePhone(phone);
+    const lead = await prisma.lead.findUnique({ where: { id: leadId } });
+    if (!lead) {
+      return res.status(404).json({ success: false, error: "Lead not found" });
+    }
+    if (lead.onCall) {
+      return res.status(409).json({ success: false, error: "Lead is already on a call" });
+    }
 
-    const [existingAppointment, lastCall] = await Promise.all([
-      prisma.appointment.findFirst({
-        where: {
-          phone: normalizedPhone,
-          status: { in: ["active", "pending", "ongoing"] },
-          dateTime: { gte: new Date() },
-        },
-        orderBy: { dateTime: "asc" },
-      }),
-      prisma.call.findFirst({
-        where: { phone: normalizedPhone },
-        orderBy: { createdAt: "desc" },
-      }),
-    ]);
+    const phone = normalizePhone(lead.phone);
+    const hasHistory = Array.isArray(lead.summary) && lead.summary.length > 0;
+    const systemPrompt = hasHistory ? buildFollowUpPrompt(lead) : buildNewCallPrompt(lead);
 
-    const systemPrompt = buildAppointmentSystemPrompt({
-      phone: normalizedPhone,
-      lastCallSummary: lastCall?.summary ?? null,
-      existingAppointment: existingAppointment
-        ? {
-            name: existingAppointment.name,
-            specialist: existingAppointment.specialist,
-            localTime: new Intl.DateTimeFormat("en-GB", {
-              hour: "2-digit",
-              minute: "2-digit",
-              hour12: false,
-              timeZone: process.env.CLINIC_TIMEZONE || "Asia/Kolkata",
-            }).format(existingAppointment.dateTime),
-            dateTime: existingAppointment.dateTime.toISOString(),
-          }
-        : null,
+    setCallContext(phone, { systemPrompt, leadId: lead.id, name: lead.name });
+    await prisma.lead.update({
+      where: { id: lead.id },
+      data: { onCall: true, callMade: true },
     });
 
-    setPendingCall(normalizedPhone, { systemPrompt, name: name ?? existingAppointment?.name });
-
-    const call = await initiateOutboundCall(normalizedPhone);
+    const { callId, provider } = await initiateOutboundCall(phone);
 
     return res.status(200).json({
       success: true,
-      data: {
-        callSid: call.sid,
-        phone: normalizedPhone,
-        hasExistingAppointment: Boolean(existingAppointment),
-        usedPreviousSummary: Boolean(lastCall?.summary),
-      },
+      data: { callId, provider, phone, followUp: hasHistory },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -80,69 +57,133 @@ callsRouter.post("/initiate", async (req: Request, res: Response) => {
 });
 
 // =========================================================
-// POST /api/calls/webhook/voice?phone=...
-// Twilio hits this once the call is answered -> returns TwiML
+// VOBIZ WEBHOOKS (default provider)
 // =========================================================
-callsRouter.post("/webhook/voice", (req: Request, res: Response) => {
-  const phone = (req.query.phone as string) || "unknown";
-  const twiml = buildVoiceTwiml(phone);
+
+// Answer webhook for OUTBOUND calls (set as answer_url when dialling).
+// Returns Stream XML connecting the call audio to our WebSocket.
+callsRouter.post("/vobiz/answer", (req: Request, res: Response) => {
+  const phone =
+    (req.query.phone as string) || req.body?.From || req.body?.from || "unknown";
+  const callUuid =
+    req.body?.CallUUID || req.body?.call_uuid || req.body?.RequestUUID || "unknown";
+  console.log(`[vobiz] answer — phone: ${phone} uuid: ${callUuid}`);
+
   res.set("Content-Type", "text/xml");
-  res.status(200).send(twiml);
+  res.status(200).send(buildVobizAnswerXml(phone, callUuid));
 });
 
-// =========================================================
-// POST /api/calls/webhook/status
-// Twilio call status callback (logs only — actual save happens
-// in callSession.ts once the media stream's "stop" event fires)
-// =========================================================
-callsRouter.post("/webhook/status", (req: Request, res: Response) => {
-  const callSid = req.body.CallSid;
-  const callStatus = req.body.CallStatus;
-  console.log(`[status webhook] sid=${callSid} status=${callStatus}`);
+// Answer webhook for INBOUND calls (set as answer_url on the Vobiz number).
+// Looks the caller up (or creates a lead) while ringing, then returns the
+// same Stream XML as outbound calls.
+callsRouter.post("/vobiz/inbound", async (req: Request, res: Response) => {
+  const rawPhone = req.body?.From || req.body?.from || "unknown";
+  const callUuid =
+    req.body?.CallUUID || req.body?.call_uuid || req.body?.RequestUUID || "unknown";
+  console.log(`[vobiz] inbound — from: ${rawPhone} uuid: ${callUuid}`);
+
+  res.set("Content-Type", "text/xml");
+  try {
+    const phone = await prepareInboundCall(rawPhone, callUuid);
+    res.status(200).send(buildVobizAnswerXml(phone, callUuid));
+  } catch (err) {
+    console.error("[vobiz] inbound failed:", (err as Error).message);
+    res.status(200).send(buildVobizHangupXml());
+  }
+});
+
+// Hangup callback — retry bookkeeping for unanswered/failed calls.
+callsRouter.post("/vobiz/hangup", async (req: Request, res: Response) => {
+  const callUuid =
+    req.body?.CallUUID ||
+    req.body?.call_uuid ||
+    req.body?.RequestUUID ||
+    req.body?.request_uuid;
+  const callStatus = (
+    req.body?.CallStatus ||
+    req.body?.call_status ||
+    req.body?.HangupCause ||
+    req.body?.hangup_cause ||
+    ""
+  ).toLowerCase();
+
+  if (callUuid && callStatus) {
+    console.log(`[vobiz] hangup — uuid: ${callUuid} status: ${callStatus}`);
+    await handleVobizHangup(callUuid, callStatus);
+  }
   res.status(204).send();
 });
 
 // =========================================================
-// GET /api/calls?phone=...
-// List saved call records, most recent first
+// TWILIO WEBHOOKS (kept for future use — CALL_PROVIDER=twilio)
 // =========================================================
-callsRouter.get("/", async (req: Request, res: Response) => {
-  const phone = (req.query.phone as string) || undefined;
 
-  const calls = await prisma.call.findMany({
-    where: phone ? { phone } : undefined,
-    orderBy: { createdAt: "desc" },
-    take: 50,
-  });
+callsRouter.post("/twilio/voice", (req: Request, res: Response) => {
+  const phone = (req.query.phone as string) || "unknown";
+  res.set("Content-Type", "text/xml");
+  res.status(200).send(buildTwilioVoiceTwiml(phone));
+});
 
-  res.status(200).json({ success: true, data: calls });
+callsRouter.post("/twilio/inbound", async (req: Request, res: Response) => {
+  const rawPhone = req.body?.From || "unknown";
+  const callSid = req.body?.CallSid || "unknown";
+  console.log(`[twilio] inbound — from: ${rawPhone} sid: ${callSid}`);
+
+  res.set("Content-Type", "text/xml");
+  try {
+    const phone = await prepareInboundCall(rawPhone, callSid);
+    res.status(200).send(buildTwilioVoiceTwiml(phone));
+  } catch (err) {
+    console.error("[twilio] inbound failed:", (err as Error).message);
+    res
+      .status(200)
+      .send('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+  }
+});
+
+callsRouter.post("/twilio/status", (req: Request, res: Response) => {
+  console.log(`[twilio] status — sid=${req.body.CallSid} status=${req.body.CallStatus}`);
+  res.status(204).send();
 });
 
 // =========================================================
-// GET /api/calls/:id
+// Shared inbound preparation: resolve (or create) the lead for the caller
+// and register the call context so the media stream picks it up.
 // =========================================================
-callsRouter.get("/:id", async (req: Request, res: Response) => {
-  const call = await prisma.call.findUnique({ where: { id: req.params.id } });
+async function prepareInboundCall(rawPhone: string, callId: string): Promise<string> {
+  const phone = normalizePhone(rawPhone);
+  const last10 = phone.replace(/\D/g, "").slice(-10);
 
-  if (!call) {
-    return res.status(404).json({ success: false, error: "Call not found" });
+  let lead =
+    last10.length === 10
+      ? await prisma.lead.findFirst({
+          where: { phone: { endsWith: last10 } },
+          orderBy: { updatedAt: "desc" },
+        })
+      : null;
+
+  const known = Boolean(lead);
+  if (!lead) {
+    lead = await prisma.lead.create({
+      data: { name: "Inbound Caller", phone, onCall: true },
+    });
+  } else {
+    await prisma.lead.update({ where: { id: lead.id }, data: { onCall: true } });
   }
 
-  res.status(200).json({ success: true, data: call });
-});
-
-// =========================================================
-// GET /api/calls/appointments?phone=...
-// List saved appointments, soonest first (optional ?phone= filter)
-// =========================================================
-callsRouter.get("/appointments/list", async (req: Request, res: Response) => {
-  const phone = (req.query.phone as string) || undefined;
-
-  const appointments = await prisma.appointment.findMany({
-    where: phone ? { phone } : undefined,
-    orderBy: { dateTime: "asc" },
-    take: 100,
+  const systemPrompt = buildInboundPrompt({
+    id: lead.id,
+    name: lead.name,
+    phone,
+    jobDescription: lead.jobDescription,
+    status: lead.status,
+    stage: lead.stage,
+    summary: lead.summary,
+    isKnown: known,
   });
 
-  res.status(200).json({ success: true, data: appointments });
-});
+  setCallContext(phone, { systemPrompt, leadId: lead.id, name: lead.name });
+  linkCallId(callId, phone);
+  console.log(`[inbound] ${phone} → ${known ? `known lead ${lead.id}` : `new lead ${lead.id}`}`);
+  return phone;
+}

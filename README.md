@@ -1,17 +1,40 @@
-# Voice Call Backend (Express)
-I made this app for managing appointments for local business or organisations.
+# Lead Call Assistant
 
-## What it does
+AI voice agent that generates and follows up lead calls for **software
+development services by Shaban Khan**. It dials leads over **Vobiz**
+(default; Twilio kept for future use), talks to them with **Gemini Live**,
+and records everything on a single `leads` table in **PostgreSQL**.
 
-1. **`POST /api/calls/initiate`** — call any phone number.
-2. Before dialing, it looks up the **most recent call summary** for that
-   number in Postgres and folds it into the Gemini system prompt.
-3. Twilio connects the call audio to a WebSocket (`/api/calls/stream`),
-   bridging audio between Twilio and **Gemini Live** in real time.
-4. When the call ends, the transcript is summarized into **100-200 words**
-   by Gemini.
-5. That summary is saved to **Postgres** (`calls` table) and embedded +
-   upserted into **Pinecone**.
+## How it works
+
+1. **Create a lead** (`POST /api/leads`) with a name, phone, and optionally
+   what they want built, budget, and timeline.
+2. The **dialer cron** (every 30s, inside the 10:00–19:00 IST window) picks up:
+   - **New calls** — leads never called (`call_made=false`, no `next_date`)
+   - **Follow-up calls** — leads whose scheduled `next_date` has arrived
+3. Vobiz answers → the call audio streams over WebSocket
+   (`/api/calls/stream`) and is bridged to **Gemini Live** in real time.
+4. The agent uses two minimal tools:
+   - `save_call_summary` — appends the call summary to `leads.summary[]` and
+     updates `status` / `stage` / `next_date` / any lead fields it learned
+   - `hangup_call` — ends the call (after saving)
+5. Unanswered/busy calls are retried (`MAX_CALL_RETRIES`, spaced by
+   `RETRY_WAIT_SECONDS`). If the agent never saves a summary, a fallback
+   summary is generated from the transcript.
+6. **Inbound calls** to the Vobiz number are answered too: known numbers get
+   their history in the prompt; unknown callers get a fresh lead created.
+
+## Lead model
+
+| Field | Notes |
+|---|---|
+| `name`, `phone` | required |
+| `job_description`, `budget`, `timeline` | filled by the agent as it learns them |
+| `status` | `active` \| `pending` \| `ongoing` \| `completed` |
+| `stage` | `first_meet` → `designing` → `development` → `testing` → `debugging` → `delivery` |
+| `next_date` | when the next call/meeting is due (drives follow-up calls) |
+| `summary` | JSON array of `{ text, createdAt }`, one entry per call |
+| `call_made`, `on_call`, `retry` | dialer bookkeeping |
 
 ## Setup
 
@@ -22,72 +45,103 @@ npx prisma migrate dev --name init
 npm run dev
 ```
 
-Expose your local server publicly (Twilio needs to reach it):
+## Testing locally (no Vobiz, no ngrok, no phone)
+
+The built-in test page bridges your **browser mic ↔ Gemini Live** using the
+same prompts and tools as a real call — `save_call_summary` really writes to
+the lead in Postgres, so the whole loop is testable end-to-end. Only
+`DATABASE_URL` and `GEMINI_API_KEY` need to be set.
+
+```bash
+# optional: stop the dialer from placing real calls while testing
+# (in .env) DIALER_ENABLED=false
+npm run dev
+```
+
+Then open **http://localhost:3000/test.html**:
+
+1. Create a test lead (or pick an existing one).
+2. Click **Start test call** and allow mic access — the agent greets you.
+3. Talk; end the call naturally ("bye"), and the agent saves the summary and
+   hangs up. Refresh the lead list to see `summary[]`/`status`/`next_date`
+   updated. Start another session with the same lead to test the
+   **follow-up** prompt (it now has history).
+
+## Going live
+
+Expose your local server publicly (Vobiz must reach it):
 
 ```bash
 ngrok http 3000
 ```
 
-Set `PUBLIC_BASE_URL` in `.env` to that ngrok URL. Create a Pinecone index
-named whatever you put in `PINECONE_INDEX`, with a vector dimension matching
-your embedding model's output (check Pinecone/Gemini docs for the exact
-number for `gemini-embedding-001` before creating the index).
+Set `PUBLIC_BASE_URL` in `.env` to that URL. On the Vobiz number used for
+inbound, set the answer URL to `POST {PUBLIC_BASE_URL}/api/calls/vobiz/inbound`.
 
-## Making a call
+## Creating a lead (the dialer calls it automatically)
+
+```bash
+curl -X POST http://localhost:3000/api/leads \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Ramesh", "phone": "+919876543210", "jobDescription": "E-commerce website"}'
+```
+
+Or trigger a call immediately:
 
 ```bash
 curl -X POST http://localhost:3000/api/calls/initiate \
   -H "Content-Type: application/json" \
-  -d '{"phone": "+919876543210", "name": "Ramesh"}'
+  -d '{"leadId": "<lead-uuid>"}'
 ```
-
-A successful response looks like:
-```json
-{ "success": true, "data": { "callSid": "CAxxxx...", "phone": "+91...", "usedPreviousSummary": false } }
-```
-
-If you don't get a real `callSid` back, the call was never placed — check
-the error message in the response. If you do get one but the phone never
-rings, check Twilio Console → Monitor → Logs → Calls (trial account
-restrictions and unverified numbers are the most common cause).
 
 ## Endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Basic liveness check |
-| POST | `/api/calls/initiate` | Start an outbound call |
-| POST | `/api/calls/webhook/voice` | Twilio voice webhook (returns TwiML) |
-| POST | `/api/calls/webhook/status` | Twilio call status callback |
-| WS | `/api/calls/stream` | Twilio Media Stream ↔ Gemini Live bridge |
-| GET | `/api/calls` | List saved call records (optional `?phone=`) |
-| GET | `/api/calls/:id` | Fetch one call record |
+| GET | `/health` | Liveness check |
+| POST | `/api/leads` | Create a lead |
+| GET | `/api/leads` | List leads (`?status=&stage=&phone=`) |
+| GET | `/api/leads/:id` | Fetch one lead |
+| PATCH | `/api/leads/:id` | Update a lead |
+| DELETE | `/api/leads/:id` | Delete a lead |
+| POST | `/api/calls/initiate` | Call a lead now (`{ leadId }`) |
+| POST | `/api/calls/vobiz/answer` | Vobiz outbound answer webhook (Stream XML) |
+| POST | `/api/calls/vobiz/inbound` | Vobiz inbound answer webhook |
+| POST | `/api/calls/vobiz/hangup` | Vobiz hangup callback (retry bookkeeping) |
+| POST | `/api/calls/twilio/voice` | Twilio voice webhook (future use) |
+| POST | `/api/calls/twilio/inbound` | Twilio inbound webhook (future use) |
+| POST | `/api/calls/twilio/status` | Twilio status callback (future use) |
+| WS | `/api/calls/stream` | Media stream ↔ Gemini Live bridge (both providers) |
 
 ## Project structure
 
 ```
 src/
-├── server.ts            ← entry point: http server + WS upgrade handling
+├── server.ts             ← entry point: http server + WS upgrade + dialer start
 ├── app.ts                ← Express app (middleware + route mounting)
 ├── routes/
-│   └── calls.routes.ts   ← all /api/calls/* HTTP routes
+│   ├── calls.routes.ts   ← call initiation + Vobiz/Twilio webhooks
+│   └── leads.routes.ts   ← leads CRUD
 └── lib/
-    ├── prisma.ts          ← Prisma client
-    ├── phone.ts           ← phone normalization
-    ├── pendingCalls.ts    ← bridges "initiate" prompt → WS handler
-    ├── prompt.ts          ← system prompt builder (+ last summary)
-    ├── twilio.ts          ← places call, builds TwiML
-    ├── gemini.ts          ← Gemini Live session, summary, embeddings
-    ├── pinecone.ts        ← embeds + upserts summary
-    ├── audio.ts           ← mulaw↔PCM conversion (Twilio↔Gemini)
-    └── callSession.ts     ← the actual bridge + finalize-on-hangup logic
+    ├── prisma.ts         ← Prisma client (Postgres)
+    ├── phone.ts          ← phone normalization
+    ├── callRegistry.ts   ← bridges initiate-time prompt → media-stream handler
+    ├── prompt.ts         ← short lead-gen prompts (new / follow-up / inbound)
+    ├── lead-tools.ts     ← save_call_summary + hangup_call tools
+    ├── vobiz.ts          ← Vobiz REST + answer XML + hangup bookkeeping
+    ├── twilio.ts         ← Twilio (lazy, future use)
+    ├── provider.ts       ← provider switch (CALL_PROVIDER, default vobiz)
+    ├── dialer.ts         ← new-call + follow-up dialer cron
+    ├── gemini.ts         ← Gemini Live session + fallback summary
+    ├── audio.ts          ← mulaw↔PCM conversion
+    └── callSession.ts    ← media stream ↔ Gemini bridge + finalize logic
 ```
 
 ## Notes before going live
 
-- **Gemini Live SDK surface**: `gemini.ts` uses `@google/genai`'s
-  `ai.live.connect(...)`. Field/event names shift across SDK versions —
-  verify against what you install.
-- **In-memory pending-call store** only works with a single Node process.
-  Swap for Redis if you scale to multiple instances.
-- **Pinecone index dimension** must match your embedding model's output size.
+- **Vobiz `keepCallAlive="true"`** means closing the WebSocket does NOT end
+  the call — the agent's `hangup_call` tool triggers the REST hangup.
+- **In-memory call registry** only works with a single Node process. Swap for
+  Redis if you scale out.
+- **Gemini Live SDK surface** (`ai.live.connect`) shifts across `@google/genai`
+  versions — verify against the installed version.

@@ -1,5 +1,5 @@
 generator client {
-  provider = "prisma-client-js"
+  provider   = "prisma-client-js"
   engineType = "client"
 }
 
@@ -7,15 +7,49 @@ datasource db {
   provider = "postgresql"
 }
 
-model Call {
-  id        String   @id @default(uuid())
-  name      String?
-  phone     String
-  summary   String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+// Lead pipeline status — is this lead/project moving?
+enum LeadStatus {
+  active
+  pending
+  ongoing
+  completed
+}
 
-  // Speeds up "fetch last call summary for this phone" lookups
-  @@index([phone, createdAt])
-  @@map("calls")
+// Project delivery stage for leads that convert into work.
+enum LeadStage {
+  first_meet
+  designing
+  development
+  testing
+  debugging
+  delivery
+}
+
+model Lead {
+  id             String     @id @default(uuid())
+  name           String
+  phone          String
+  jobDescription String?    @map("job_description")
+  budget         String?
+  timeline       String?
+  // Array of { text: string, createdAt: ISO string } — one entry per call.
+  summary        Json       @default("[]")
+  status         LeadStatus @default(active)
+  stage          LeadStage  @default(first_meet)
+  nextDate       DateTime?  @map("next_date")
+
+  // Dialer bookkeeping (same contract as the TSK Backend dialer):
+  // callMade — an AI call has been initiated/completed for this lead.
+  // onCall   — a call is live right now, so the cron must not re-dial.
+  // retry    — failed dial attempts (no-answer/busy); capped by MAX_CALL_RETRIES.
+  callMade Boolean @default(false) @map("call_made")
+  onCall   Boolean @default(false) @map("on_call")
+  retry    Int     @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([phone])
+  @@index([nextDate])
+  @@map("leads")
 }
